@@ -241,7 +241,8 @@ class AbletonMCP(ControlSurface):
                                  "set_device_parameter", "set_device_enabled",
                                  "delete_device", "navigate_preset",
                                  "delete_track",
-                                 "set_track_volume", "set_track_panning"]:
+                                 "set_track_volume", "set_track_panning",
+                                 "get_clip_grid"]:
                 # Use a thread-safe approach with a response queue
                 response_queue = queue.Queue()
                 
@@ -393,6 +394,10 @@ class AbletonMCP(ControlSurface):
                             ci = params.get("chain_index", None)
                             direction = params.get("direction", "current")
                             result = self._navigate_preset(ti, di, ci, direction)
+                        elif command_type == "get_clip_grid":
+                            num_tracks = params.get("num_tracks", 16)
+                            num_scenes = params.get("num_scenes", 8)
+                            result = self._get_clip_grid(num_tracks, num_scenes)
 
                         # Put the result in the queue
                         response_queue.put({"status": "success", "result": result})
@@ -575,7 +580,48 @@ class AbletonMCP(ControlSurface):
         except Exception as e:
             self.log_message("Error getting session info: " + str(e))
             raise
-    
+
+    def _get_clip_grid(self, num_tracks=16, num_scenes=8):
+        """Compact, MAIN-THREAD snapshot of the Session grid for a hardware control surface.
+        One round-trip instead of N get_track_info calls. Scheduled on Live's main thread (added
+        to the modifying-command whitelist) so the Live API is read where it's thread-safe.
+        Returns tempo, global is_playing, track_count, and per-track name/volume + per-slot
+        {has_clip, playing, triggered, recording, color(0xRRGGBB)} for the first
+        num_tracks x num_scenes slots (-1 = all)."""
+        song = self._song
+        total = len(song.tracks)
+        nt = total if num_tracks is None or num_tracks < 0 else min(num_tracks, total)
+        tracks_out = []
+        for t in range(nt):
+            track = song.tracks[t]
+            slots = track.clip_slots
+            ns = len(slots) if num_scenes is None or num_scenes < 0 else min(num_scenes, len(slots))
+            slots_out = []
+            for s in range(ns):
+                slot = slots[s]
+                info = {"has_clip": bool(slot.has_clip), "triggered": bool(slot.is_triggered),
+                        "playing": False, "recording": False, "color": 0}
+                if slot.has_clip:
+                    clip = slot.clip
+                    info["playing"] = bool(clip.is_playing)
+                    info["recording"] = bool(clip.is_recording)
+                    try:
+                        info["color"] = int(clip.color)  # 0xRRGGBB
+                    except Exception:
+                        info["color"] = 0
+                slots_out.append(info)
+            tracks_out.append({
+                "name": track.name,
+                "volume": track.mixer_device.volume.value,
+                "slots": slots_out,
+            })
+        return {
+            "tempo": song.tempo,
+            "is_playing": bool(song.is_playing),
+            "track_count": total,
+            "tracks": tracks_out,
+        }
+
     def _get_track_info(self, track_index):
         """Get information about a track"""
         try:
